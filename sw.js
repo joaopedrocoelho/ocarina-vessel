@@ -1,5 +1,5 @@
 // Vessel service worker: works offline, refreshes itself in the background.
-const CACHE = 'vessel-v1';
+const CACHE = 'vessel-v2';
 const ASSETS = ['./', './index.html', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png'];
 
 self.addEventListener('install', e => {

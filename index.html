@@ -170,6 +170,9 @@ textarea{resize:vertical;line-height:1.5;font-family:ui-monospace,Menlo,Consolas
 .help{font-size:14px;color:var(--mute);background:var(--card2);border-radius:12px;padding:10px 12px}
 .help code{font-family:ui-monospace,Menlo,Consolas,monospace;background:var(--bg);padding:1px 5px;border-radius:5px;color:var(--ink)}
 .set-row{display:grid;gap:8px}
+.midi{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center}
+.midi label.btn{cursor:pointer}
+select{appearance:auto}
 .set-row>span{font-weight:650}
 
 #toast{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom));transform:translate(-50%,20px);background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:12px;font-weight:650;font-size:15px;opacity:0;pointer-events:none;transition:.2s;z-index:50;max-width:calc(100vw - 32px);text-align:center}
@@ -479,6 +482,106 @@ function parseNums(text) {
 const parse = (src, fmt) => fmt === 'buttons' ? parseButtons(src) : fmt === 'nums' ? parseNums(src) : parseNotes(src);
 const FMT_NAME = { notes: 'Letters', nums: 'Numbered (簡譜)', buttons: 'Game buttons' };
 
+/* ---------------- MIDI import ---------------- */
+// Reads a Standard MIDI File (format 0 or 1) into tracks of {ch, n, t, e} notes, plus tempo and time signature.
+function readMidi(buf) {
+  const d = new DataView(buf), len = d.byteLength; let p = 0;
+  const need = n => { if (p + n > len) throw new Error('The file ends early'); };
+  const u8 = () => { need(1); return d.getUint8(p++); };
+  const u16 = () => { need(2); const v = d.getUint16(p); p += 2; return v; };
+  const u32 = () => { need(4); const v = d.getUint32(p); p += 4; return v; };
+  const tag = () => { need(4); let s = ''; for (let i = 0; i < 4; i++) s += String.fromCharCode(d.getUint8(p + i)); p += 4; return s; };
+  const vlq = () => { let v = 0, b, i = 0; do { b = u8(); v = (v << 7) | (b & 127); } while (b & 128 && ++i < 4); return v; };
+  const text = n => { need(n); const t = new TextDecoder('utf-8', { fatal: false }).decode(new Uint8Array(buf, p, n)); p += n; return t.replace(/\u0000/g, '').trim(); };
+  if (tag() !== 'MThd') throw new Error('This is not a MIDI file');
+  const hl = u32(), fmt = u16(), ntr = u16(), div = u16(); p = 8 + hl;
+  if (div & 0x8000) throw new Error('This MIDI uses SMPTE timing, which isn’t supported');
+  const tracks = []; let tempo = 0, ts = null;
+  for (let t = 0; t < ntr && p + 8 <= len; t++) {
+    const id = tag(), tl = u32(), end = Math.min(len, p + tl);
+    if (id !== 'MTrk') { p = end; continue; }
+    let tick = 0, rs = 0, name = '';
+    const on = {}, notes = [], prog = {};
+    while (p < end) {
+      tick += vlq();
+      let st = d.getUint8(p);
+      if (st & 0x80) { p++; if (st < 0xF0) rs = st; } else { if (!rs) throw new Error('Damaged track data'); st = rs; }
+      if (st === 0xFF) {
+        const type = u8(), l = vlq();
+        if (type === 0x03 && !name) name = text(l);
+        else { if (type === 0x51 && !tempo && l >= 3) tempo = (d.getUint8(p) << 16) | (d.getUint8(p + 1) << 8) | d.getUint8(p + 2);
+               if (type === 0x58 && !ts && l >= 2) ts = [d.getUint8(p), 1 << d.getUint8(p + 1)];
+               p += l; }
+        if (type === 0x2F) break;
+        continue;
+      }
+      if (st === 0xF0 || st === 0xF7) { p += vlq(); continue; }
+      const hi = st & 0xF0, ch = st & 0x0F, a = u8(), b = (hi === 0xC0 || hi === 0xD0) ? 0 : u8();
+      const k = ch * 128 + a;
+      if (hi === 0x90 && b > 0) { (on[k] || (on[k] = [])).push(notes.length); notes.push({ ch, n: a, t: tick, e: null }); }
+      else if (hi === 0x80 || hi === 0x90) { const q = on[k]; if (q && q.length) notes[q.shift()].e = tick; }
+      else if (hi === 0xC0) prog[ch] = a;
+    }
+    p = end;
+    notes.forEach(x => { if (x.e == null || x.e <= x.t) x.e = x.t + div; });
+    tracks.push({ name, notes, prog });
+  }
+  return { fmt, div, bpm: tempo ? Math.round(60e6 / tempo) : 120, ts, tracks };
+}
+const GM = ['Piano','Piano','Piano','Piano','E-piano','E-piano','Harpsichord','Clavinet','Celesta','Glockenspiel','Music box','Vibraphone','Marimba','Xylophone','Bells','Dulcimer','Organ','Organ','Organ','Church organ','Organ','Accordion','Harmonica','Accordion','Guitar','Guitar','Guitar','Guitar','Guitar','Guitar','Guitar','Guitar','Bass','Bass','Bass','Bass','Bass','Bass','Bass','Bass','Violin','Viola','Cello','Contrabass','Strings','Strings','Harp','Timpani','Strings','Strings','Strings','Strings','Choir','Voice','Voice','Orchestra hit','Trumpet','Trombone','Tuba','Trumpet','Horn','Brass','Brass','Brass','Sax','Sax','Sax','Sax','Oboe','English horn','Bassoon','Clarinet','Piccolo','Flute','Recorder','Pan flute','Bottle','Shakuhachi','Whistle','Ocarina'];
+// One choice per track and channel (drums on channel 10 skipped), labelled for a picker.
+function midiParts(mid) {
+  const parts = [];
+  mid.tracks.forEach((tr, ti) => {
+    const chs = [...new Set(tr.notes.map(x => x.ch))].filter(c => c !== 9);
+    chs.forEach(c => {
+      const notes = tr.notes.filter(x => x.ch === c); if (notes.length < 4) return;
+      const avg = notes.reduce((a, x) => a + x.n, 0) / notes.length, lo = Math.min(...notes.map(x => x.n)), hi = Math.max(...notes.map(x => x.n));
+      const inst = tr.prog[c] != null ? GM[tr.prog[c]] || 'Synth' : '';
+      const label = [tr.name || `Track ${ti + 1}`, chs.length > 1 ? `ch ${c + 1}` : '', inst && inst !== tr.name ? inst : ''].filter(Boolean).join(' · ');
+      parts.push({ label, notes, avg, lo, hi });
+    });
+  });
+  // a melody is usually the highest part with a fair number of notes
+  const pool = parts.filter(x => x.notes.length >= 16);
+  const best = (pool.length ? pool : parts).reduce((a, x) => !a || x.avg > a.avg ? x : a, null);
+  return { parts, best: parts.indexOf(best) };
+}
+// Turns one part into Letters text: top note of each chord, rhythm rounded to quarter beats, shifted into the ocarina's range.
+function midiToText(part, mid) {
+  const div = mid.div, tol = div / 12, mel = [];
+  [...part.notes].sort((a, b) => a.t - b.t || b.n - a.n).forEach(x => {
+    const last = mel[mel.length - 1];
+    if (last && x.t - last.t <= tol) { if (x.n > last.n) { last.n = x.n; last.e = x.e; } return; }
+    mel.push({ n: x.n, t: x.t, e: x.e });
+  });
+  if (!mel.length) return { text: '', shift: 0, out: 0, count: 0 };
+  const outFor = k => mel.filter(x => x.n + k < LOW || x.n + k > HIGH).length;
+  let shift = 0, best = Infinity;
+  for (let k = -48; k <= 48; k++) { const sc = outFor(k) * 1000 + (k % 12 ? 40 : 0) + Math.abs(k); if (sc < best) { best = sc; shift = k; } }
+  const NM = ['C','C#','D','Eb','E','F','F#','G','G#','A','Bb','B'];
+  const bar = mid.ts ? mid.ts[0] * 4 / mid.ts[1] : 4;
+  const tok = [], start = mel[0].t; let pos = 0, nextBar = bar - ((start / div) % bar || 0), bars = 0;
+  const push = (s, len) => { tok.push(s); pos += len; while (pos >= nextBar - 1e-6) { nextBar += bar; bars++; tok.push(bars % 4 ? '|' : '|\n'); } };
+  // positions snap to a quarter-beat grid measured from the first note, so long songs don't drift
+  const at = t => Math.round((t - start) / div * 4) / 4;
+  mel.forEach((x, i) => {
+    const nx = mel[i + 1], s0 = at(x.t), endRaw = (x.e - start) / div, nextS = nx ? at(nx.t) : null;
+    let dur, rest = 0;
+    if (nx && nextS - endRaw < .5) dur = nextS - s0;                       // legato: hold until the next note
+    else {
+      let endQ = Math.round(endRaw * 2) / 2; if (endQ <= s0) endQ = s0 + Math.max(.25, Math.round((endRaw - s0) * 4) / 4);
+      dur = endQ - s0; rest = nx ? nextS - endQ : 0;
+      if (rest < .25) { dur += Math.max(0, rest); rest = 0; }
+    }
+    dur = Math.max(.25, dur); const m = x.n + shift;
+    push(NM[pc(m)] + oc(m) + (dur !== 1 ? ':' + dur : ''), dur);
+    if (rest) push('r' + (rest !== 1 ? ':' + rest : ''), rest);
+  });
+  const text = tok.join(' ').replace(/ \|\n /g, ' |\n').replace(/[ |\n]+$/, '');
+  return { text, shift, out: outFor(shift), count: mel.length };
+}
+
 /* ---------------- songs ---------------- */
 const BUILTIN = [
   { id: 'mary', t: 'Mary Had a Little Lamb', s: 'Lesson 3 · C to G', src: 'E5 D C D E E E:2 D D D:2 E G G:2 E D C D E E E E D D E D C:4' },
@@ -535,9 +638,10 @@ const LESSONS = [
 <li>The ones you'll meet first are B♭, F♯ and C♯.</li>
 <li>These fingerings vary a little between makers. Compare them with the chart in your NIGHT box. If one differs, open <b>Fingerings › Edit</b> and tap the holes to match.</li></ul>`,
     acts: [['chart', 82, 'See B♭'], ['chart', 78, 'See F♯'], ['song', 'bday', 'Play: Happy Birthday']] },
-  { t: 'Songs from your favourite game', s: 'Paste a button sequence or a tab', n: 86, body: `<ul>
+  { t: 'Songs from your favourite game', s: 'Paste a button sequence or a tab, or import a MIDI', n: 86, body: `<ul>
 <li>Go to <b>Songs › Add a song</b>, pick <b>Buttons</b> and paste the button sequence from any walkthrough (A, C-down, C-right, C-left, C-up). The five buttons become D, F, A, B and high D on your ocarina.</li>
 <li>For longer soundtrack pieces, paste a letter-note tab in <b>Letters</b> mode, or a numbered (簡譜) tab in <b>1 2 3</b> mode. If a note lands in the wrong octave, put <code>^</code> (higher) or <code>v</code> (lower) in front of it, or use the transpose buttons.</li>
+<li>Have a MIDI file of the tune? Tap <b>Import a MIDI file</b>, pick the part that carries the melody, and the app writes it out as notes you can tweak.</li>
 <li>Learn it in Step mode first, then switch to Follow and let the app listen while you play.</li></ul>`,
     acts: [['add', 0, 'Add a song']] }
 ];
@@ -659,7 +763,7 @@ function vSongs() {
   return `<section class="view">
   <div class="spread"><h1>Songs</h1><button class="btn pri" data-act="add">+ Add a song</button></div>
   <div><h2 style="margin-bottom:8px">Your songs</h2>
-    ${mine.length ? `<div class="list">${mine.map(item).join('')}</div>` : `<div class="empty"><p style="margin-top:0">Paste a tab or an in-game button sequence and it becomes a play-along guide.</p><button class="btn pri" data-act="add">Add your first song</button></div>`}
+    ${mine.length ? `<div class="list">${mine.map(item).join('')}</div>` : `<div class="empty"><p style="margin-top:0">Paste a tab or an in-game button sequence, or import a MIDI file, and it becomes a play-along guide.</p><button class="btn pri" data-act="add">Add your first song</button></div>`}
   </div>
   <div><h2 style="margin-bottom:8px">Practice songs</h2><div class="list">${BUILTIN.map(item).join('')}</div></div>
 </section>`;
@@ -669,7 +773,7 @@ function vSongs() {
 function openSong(id) {
   const x = songById(id); if (!x) return;
   stopPlay();
-  P.song = x; P.tr = x.tr || 0; P.idx = 0; P.armed = true;
+  P.song = x; P.tr = x.tr || 0; P.idx = 0; P.armed = true; P.bpm = Math.max(40, Math.min(200, x.bpm || 90));
   P.notes = parse(x.src, x.fmt).notes.map(n => ({ m: n.m == null ? null : n.m + P.tr, b: n.b }));
   if (view !== 'songs') show('songs'); else { render(); window.scrollTo(0, 0); }
 }
@@ -693,7 +797,7 @@ function vPlayer() {
     <button class="btn" data-act="next" aria-label="Next note"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M15 6h2v12h-2zM4 6v12l9-6z"/></svg></button>
   </div>
   <div class="card" style="display:grid;gap:12px">
-    <div class="slider"><span class="small">Tempo</span><input type="range" id="pBpm" min="40" max="160" step="2" value="${P.bpm}" aria-label="Tempo"><output id="pBpmV" class="small">${P.bpm} bpm</output></div>
+    <div class="slider"><span class="small">Tempo</span><input type="range" id="pBpm" min="40" max="200" step="2" value="${P.bpm}" aria-label="Tempo"><output id="pBpmV" class="small">${P.bpm} bpm</output></div>
     <div class="spread"><span class="small">Transpose</span><div class="stepper"><button class="btn sm" data-act="tr" data-d="-1" aria-label="Down a semitone">−</button><output>${P.tr > 0 ? '+' : ''}${P.tr}</output><button class="btn sm" data-act="tr" data-d="1" aria-label="Up a semitone">+</button><button class="btn sm ghost" data-act="tr" data-d="-12">−8va</button><button class="btn sm ghost" data-act="tr" data-d="12">+8va</button></div></div>
   </div>
   <p class="small mute">Step: tap the drawing to hear the note, then Next. Listen: the app plays it while the diagram follows. Follow: you play, and it moves on when you hit each note.</p>
@@ -701,7 +805,7 @@ function vPlayer() {
 }
 function afterPlayer() {
   updatePlayer();
-  const r = $('#pBpm'); if (r) r.addEventListener('input', () => { P.bpm = +r.value; $('#pBpmV').textContent = P.bpm + ' bpm'; });
+  const r = $('#pBpm'); if (r) { r.addEventListener('input', () => { P.bpm = +r.value; $('#pBpmV').textContent = P.bpm + ' bpm'; }); r.addEventListener('change', () => { if (!P.song.builtin) { P.song.bpm = P.bpm; saveMine(); } }); }
 }
 function updatePlayer() {
   const now = $('#pNow'); if (!now) return;
@@ -771,11 +875,13 @@ dlg.addEventListener('click', e => { if (e.target === dlg) closeDlg(); });
 let ed = null; // song being edited
 function songEditor(id) {
   const x = id ? mine.find(s => s.id === id) : null;
-  ed = { id: x ? x.id : null, fmt: x ? x.fmt : 'notes' };
+  ed = { id: x ? x.id : null, fmt: x ? x.fmt : 'notes', bpm: x ? x.bpm : 0, mid: null, parts: null };
   openDlg(`<form class="dlg" id="songForm" autocomplete="off">
     <h2>${x ? 'Edit song' : 'Add a song'}</h2>
     <label class="f">Title<input type="text" name="t" maxlength="60" required value="${x ? esc(x.t) : ''}" placeholder="Song name"></label>
     <div class="seg" role="group" aria-label="Format"><button type="button" data-act="fmt" data-f="notes" aria-pressed="${ed.fmt === 'notes'}">Letters</button><button type="button" data-act="fmt" data-f="nums" aria-pressed="${ed.fmt === 'nums'}">1 2 3 簡譜</button><button type="button" data-act="fmt" data-f="buttons" aria-pressed="${ed.fmt === 'buttons'}">Buttons</button></div>
+    <div class="midi"><label class="btn sm"><input type="file" id="midiIn" accept=".mid,.midi,audio/midi,audio/x-midi" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"/></svg>Import a MIDI file</label><span class="small mute" id="midiInfo">Turns one part of a .mid file into a melody you can edit.</span></div>
+    <label class="f" id="midiPartWrap" hidden>Melody part<select id="midiPart"></select></label>
     <label class="f">Paste here<textarea name="src" rows="6" spellcheck="false">${x ? esc(x.src) : ''}</textarea></label>
     <div class="help" id="fmtHelp"></div>
     <div><div class="spread" style="margin-bottom:6px"><span class="small" style="font-weight:650">Preview</span><span class="small mute" id="prevInfo"></span></div><div class="preview" id="prev"></div><p class="warn" id="prevWarn"></p></div>
@@ -785,6 +891,31 @@ function songEditor(id) {
   const f = $('#songForm');
   f.src.addEventListener('input', preview);
   f.addEventListener('submit', e => { e.preventDefault(); saveSong(); });
+  $('#midiIn').addEventListener('change', e => { const file = e.target.files[0]; if (file) loadMidi(file); e.target.value = ''; });
+  $('#midiPart').addEventListener('change', e => applyMidiPart(+e.target.value));
+}
+async function loadMidi(file) {
+  const info = $('#midiInfo');
+  try {
+    if (file.size > 4e6) throw new Error('That file is too big for a MIDI');
+    const mid = readMidi(await file.arrayBuffer()), { parts, best } = midiParts(mid);
+    if (!parts.length) throw new Error('No melody notes found in this file');
+    ed.mid = mid; ed.parts = parts; ed.bpm = mid.bpm; ed.fname = file.name.replace(/\.(mid|midi)$/i, '');
+    const sel = $('#midiPart');
+    sel.innerHTML = parts.map((x, i) => `<option value="${i}">${esc(x.label)} · ${x.notes.length} notes · ${txt(x.lo)}–${txt(x.hi)}</option>`).join('');
+    sel.value = best; $('#midiPartWrap').hidden = false;
+    applyMidiPart(best);
+  } catch (err) { info.textContent = (err.message || 'Could not read that file') + '.'; info.className = 'small warn'; }
+}
+function applyMidiPart(i) {
+  const f = $('#songForm'), r = midiToText(ed.parts[i], ed.mid), info = $('#midiInfo');
+  if (!f.t.value.trim()) f.t.value = ed.fname.slice(0, 60);
+  ed.fmt = 'notes';
+  document.querySelectorAll('#songForm .seg button').forEach(b => b.setAttribute('aria-pressed', b.dataset.f === 'notes'));
+  f.src.value = r.text; fmtHelp(); preview();
+  const sh = r.shift ? (r.shift % 12 ? `transposed ${r.shift > 0 ? 'up' : 'down'} ${Math.abs(r.shift)} semitones` : `moved ${r.shift > 0 ? 'up' : 'down'} ${Math.abs(r.shift) / 12} octave${Math.abs(r.shift) > 12 ? 's' : ''}`) + ' to fit' : 'already in range';
+  info.className = 'small mute';
+  info.textContent = `${r.count} notes · ${ed.mid.bpm} bpm · ${sh}${r.out ? ` · ${r.out} still out of range (the part spans more than your ocarina)` : ''}. Pick another part if this isn't the tune.`;
 }
 function fmtHelp() {
   const h = $('#fmtHelp'), ta = $('#songForm').src;
@@ -815,8 +946,8 @@ function saveSong() {
   const p = parse(src, ed.fmt);
   if (!p.notes.some(n => n.m != null)) { $('#prevWarn').textContent = 'No notes found yet. Paste a sequence above.'; return; }
   let x;
-  if (ed.id) { x = mine.find(s => s.id === ed.id); Object.assign(x, { t, src, fmt: ed.fmt }); }
-  else { x = { id: 'u' + Date.now().toString(36), t, src, fmt: ed.fmt, tr: 0 }; mine.unshift(x); }
+  if (ed.id) { x = mine.find(s => s.id === ed.id); Object.assign(x, { t, src, fmt: ed.fmt }); if (ed.mid) { x.bpm = ed.bpm; x.tr = 0; } }
+  else { x = { id: 'u' + Date.now().toString(36), t, src, fmt: ed.fmt, tr: 0 }; if (ed.bpm) x.bpm = ed.bpm; mine.unshift(x); }
   saveMine(); closeDlg(); toast('Saved'); openSong(x.id);
 }
 function settingsDlg() {
@@ -873,7 +1004,7 @@ document.addEventListener('click', async e => {
     case 'import': {
       const b = $('#impBox');
       if (b.hidden) { b.hidden = false; b.value = ''; b.focus(); a.textContent = 'Restore now'; break; }
-      try { const o = JSON.parse(b.value); if (Array.isArray(o.songs)) { const ids = new Set(mine.map(s => s.id)); o.songs.filter(s => s && s.id && s.t && typeof s.src === 'string' && !ids.has(s.id)).forEach(s => mine.push({ id: String(s.id), t: String(s.t).slice(0, 60), src: s.src, fmt: FMT_NAME[s.fmt] ? s.fmt : 'notes', tr: +s.tr || 0 })); saveMine(); }
+      try { const o = JSON.parse(b.value); if (Array.isArray(o.songs)) { const ids = new Set(mine.map(s => s.id)); o.songs.filter(s => s && s.id && s.t && typeof s.src === 'string' && !ids.has(s.id)).forEach(s => mine.push({ id: String(s.id), t: String(s.t).slice(0, 60), src: s.src, fmt: FMT_NAME[s.fmt] ? s.fmt : 'notes', tr: +s.tr || 0, bpm: +s.bpm || 0 })); saveMine(); }
         if (o.fingers && typeof o.fingers === 'object') { Object.entries(o.fingers).forEach(([k, v]) => { if (DEF[k] && v && typeof v === 'object') custom[k] = F(HOLES.filter(h => v[h] === 1).join(' ') + ' ' + HOLES.filter(h => v[h] === .5).map(h => h + ':h').join(' ')); }); store.set('fingers', custom); }
         closeDlg(); toast('Restored'); render();
       } catch (err) { toast('That text is not a Vessel backup'); }
@@ -935,7 +1066,7 @@ $('#installBtn').addEventListener('click', async () => { if (!deferred) return; 
 window.addEventListener('appinstalled', () => { $('#installBtn').hidden = true; toast('Installed. Open Vessel from your home screen.'); });
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
 
-window.__vessel = { parseNotes, parseButtons, parseNums, DEF, oca, BUILTIN };
+window.__vessel = { parseNotes, parseButtons, parseNums, readMidi, midiParts, midiToText, DEF, oca, BUILTIN };
 show(location.hash.slice(1) || 'learn', { force: true });
 }
 </script>

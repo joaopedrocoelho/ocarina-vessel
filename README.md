@@ -6,7 +6,7 @@ An installable web app for learning the 12-hole Alto C ocarina (built around the
 - **Fingerings**: every note from low A to high F, with sound, finger names, and editable fingerings
 - **Tuner**: live pitch with a cents meter, plus a long-tone trainer (hold the note steady for 4 s)
 - **Songs**: Step, Listen, and Follow modes. Follow listens to you and moves on when you hit each note.
-- **Add a song**: paste letters (C D E, Do Re Mi, ドレミ), numbered 簡譜 (1=C 3 2 1…), or in-game ocarina buttons (A, C-down, C-right, C-left, C-up)
+- **Add a song**: paste letters (C D E, Do Re Mi, ドレミ), numbered 簡譜 (1=C 3 2 1…), or in-game ocarina buttons (A, C-down, C-right, C-left, C-up), or import a MIDI file. For MIDI, you pick the melody part, and it's shifted into range and keeps the file's tempo.
 
 Works offline once it's installed. Songs, settings, and stats are saved in the browser on your phone.
 
@@ -26,4 +26,4 @@ In Chrome, tap **Install app** at the top of Vessel, or use ⋮ → *Add to Home
 `npx serve .` (or `python3 -m http.server`), then open `http://localhost:<port>`. Browsers treat localhost as secure, so the mic works there.
 
 ## Updating
-Edit the files and redeploy. If an installed copy keeps showing the old version, change `CACHE` in `sw.js` (for example to `vessel-v2`).
+Edit the files and redeploy. Pages serves the `gh-pages` branch, so push there (or switch the Pages source to `main` in Settings). If an installed copy keeps showing the old version, bump `CACHE` in `sw.js`.
